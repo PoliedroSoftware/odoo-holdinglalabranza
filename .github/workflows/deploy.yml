@@ -1,0 +1,113 @@
+name: Deploy Holding La Labranza addons to staging
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "addons/**/*.py"
+      - "addons/**/*.xml"
+      - "addons/**/*.js"
+      - "addons/**/*.scss"
+      - "addons/**/*.csv"
+      - "addons/**/*.po"
+      - "addons/**/*.json"
+  workflow_dispatch:
+    inputs:
+      install_modules:
+        description: "Módulos nuevos a instalar, separados por coma (opcional)"
+        required: false
+        type: string
+      update_modules:
+        description: "Módulos ya instalados a actualizar, separados por coma (opcional)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: holdinglalabranza-staging-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      DO_HOST: 138.197.65.167
+      DO_USER: root
+      DO_BASE_DIR: /opt/poliedro-odoo
+      INSTALL_MODULES: ${{ inputs.install_modules }}
+      UPDATE_MODULES: ${{ inputs.update_modules }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate client modules and deployment inputs
+        id: validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d addons || { echo "No existe addons/." >&2; exit 1; }
+          mapfile -t module_dirs < <(find addons -mindepth 1 -maxdepth 1 -type d -print | sort)
+          ((${#module_dirs[@]} > 0)) || { echo "Agrega al menos un addon instalable bajo addons/." >&2; exit 1; }
+          modules=()
+          for module_dir in "${module_dirs[@]}"; do
+            module="$(basename "$module_dir")"
+            [[ "$module" =~ ^holdinglalabranza_[A-Za-z0-9_]+$ ]] || { echo "Nombre inválido: $module (debe iniciar holdinglalabranza_)." >&2; exit 1; }
+            test -f "$module_dir/__manifest__.py" || { echo "Falta __manifest__.py en $module_dir." >&2; exit 1; }
+            modules+=("$module")
+          done
+          validate_list() {
+            local value="$1"
+            [[ -z "$value" ]] && return 0
+            [[ "$value" =~ ^holdinglalabranza_[A-Za-z0-9_]+(,holdinglalabranza_[A-Za-z0-9_]+)*$ ]] || return 1
+            IFS=',' read -ra selected <<< "$value"
+            for module in "${selected[@]}"; do
+              [[ " ${modules[*]} " == *" $module "* ]] || { echo "El módulo solicitado no está en este commit: $module" >&2; return 1; }
+            done
+          }
+          validate_list "$INSTALL_MODULES" || { echo "install_modules no es válido." >&2; exit 1; }
+          validate_list "$UPDATE_MODULES" || { echo "update_modules no es válido." >&2; exit 1; }
+          printf 'modules=%s\n' "$(IFS=,; echo "${modules[*]}")" >> "$GITHUB_OUTPUT"
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$DO_SSH_PRIVATE_KEY" || { echo "Falta el secreto DO_SSH_PRIVATE_KEY." >&2; exit 1; }
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$DO_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' '138.197.65.167 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILqVFMa0KfH+v3eo6qS5f9ayKUG46lWB5LonitrBqm2t' > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          ssh -i "$HOME/.ssh/id_ed25519" -o BatchMode=yes -o StrictHostKeyChecking=yes "$DO_USER@$DO_HOST" 'test -d /opt/poliedro-odoo/incoming && test -d /opt/poliedro-odoo/src/custom-addons'
+
+      - name: Package client addons
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra modules <<< "${{ steps.validate.outputs.modules }}"
+          tar -czf "$RUNNER_TEMP/holdinglalabranza-addons.tar.gz" --exclude='__pycache__' --exclude='*.pyc' -C addons "${modules[@]}"
+
+      - name: Upload addon bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="holdinglalabranza-${GITHUB_SHA}.tar.gz"
+          scp -i "$HOME/.ssh/id_ed25519" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$RUNNER_TEMP/holdinglalabranza-addons.tar.gz" \
+            "$DO_USER@$DO_HOST:$DO_BASE_DIR/incoming/$archive"
+          echo "archive=$archive" >> "$GITHUB_ENV"
+
+      - name: Backup, deploy and verify Odoo
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -i "$HOME/.ssh/id_ed25519" -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$DO_USER@$DO_HOST" \
+            "bash -s -- '$archive' '$INSTALL_MODULES' '$UPDATE_MODULES'" \
+            < .github/scripts/deploy-remote.sh
