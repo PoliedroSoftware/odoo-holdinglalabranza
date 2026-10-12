@@ -1,0 +1,64 @@
+name: CI - Holding La Labranza
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - "addons/**"
+      - ".github/workflows/ci.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: holdinglalabranza-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Validate addon manifests, names and XML
+        run: |
+          python - <<'PY'
+          import ast
+          import pathlib
+          import sys
+          import xml.etree.ElementTree as ET
+
+          root = pathlib.Path("addons")
+          modules = sorted(p for p in root.iterdir() if p.is_dir()) if root.exists() else []
+          errors = []
+          for module in modules:
+              if not module.name.startswith("holdinglalabranza_"):
+                  errors.append(f"{module}: el nombre debe iniciar con holdinglalabranza_")
+              manifest = module / "__manifest__.py"
+              if not manifest.is_file():
+                  errors.append(f"{module}: falta __manifest__.py")
+                  continue
+              try:
+                  ast.literal_eval(manifest.read_text(encoding="utf-8"))
+              except (SyntaxError, ValueError) as exc:
+                  errors.append(f"{manifest}: manifiesto Python inválido: {exc}")
+              for xml_file in module.rglob("*.xml"):
+                  try:
+                      ET.parse(xml_file)
+                  except ET.ParseError as exc:
+                      errors.append(f"{xml_file}: XML inválido: {exc}")
+          if errors:
+              print("\n".join(errors), file=sys.stderr)
+              raise SystemExit(1)
+          print(f"Validación correcta: {len(modules)} addon(s) de cliente.")
+          PY
