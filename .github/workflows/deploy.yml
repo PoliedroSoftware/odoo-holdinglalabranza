@@ -13,6 +13,11 @@ on:
       - "addons/**/*.json"
   workflow_dispatch:
     inputs:
+      connection_test_only:
+        description: "Solo probar firewall, SSH y Odoo; sin subir addons ni modificar la BD"
+        required: false
+        type: boolean
+        default: false
       install_modules:
         description: "Módulos nuevos a instalar, separados por coma (opcional)"
         required: false
@@ -46,6 +51,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Validate client modules and deployment inputs
+        if: inputs.connection_test_only != true
         id: validate
         shell: bash
         run: |
@@ -85,6 +91,14 @@ jobs:
             exit 1
           }
 
+      - name: Authorize this runner temporarily on SSH
+        uses: PoliedroSoftware/odoo/.github/actions/digitalocean-ssh@813aa549d6db6337bd283260f5b47efeb66d91f9
+        with:
+          token: ${{ secrets.DO_FIREWALL_TOKEN }}
+          firewall-id: cf8761d8-6808-4268-b4d3-a2886223406d
+          droplet-id: "608212229"
+          host: "138.197.65.167"
+
       - name: Configure SSH
         shell: bash
         env:
@@ -97,9 +111,10 @@ jobs:
           chmod 600 "$HOME/.ssh/id_ed25519"
           printf '%s\n' '138.197.65.167 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILqVFMa0KfH+v3eo6qS5f9ayKUG46lWB5LonitrBqm2t' > "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
-          ssh -i "$HOME/.ssh/id_ed25519" -o BatchMode=yes -o StrictHostKeyChecking=yes "$DO_USER@$DO_HOST" 'test -d /opt/poliedro-odoo/incoming && test -d /opt/poliedro-odoo/src/custom-addons'
+          ssh -i "$HOME/.ssh/id_ed25519" -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15 "$DO_USER@$DO_HOST" 'test -d /opt/poliedro-odoo/incoming && test -d /opt/poliedro-odoo/src/custom-addons'
 
       - name: Package client addons
+        if: inputs.connection_test_only != true
         shell: bash
         run: |
           set -euo pipefail
@@ -107,6 +122,7 @@ jobs:
           tar -czf "$RUNNER_TEMP/holdinglalabranza-addons.tar.gz" --exclude='__pycache__' --exclude='*.pyc' -C addons "${modules[@]}"
 
       - name: Upload addon bundle
+        if: inputs.connection_test_only != true
         shell: bash
         run: |
           set -euo pipefail
@@ -117,6 +133,7 @@ jobs:
           echo "archive=$archive" >> "$GITHUB_ENV"
 
       - name: Backup, deploy and verify Odoo
+        if: inputs.connection_test_only != true
         shell: bash
         run: |
           set -euo pipefail
@@ -124,3 +141,23 @@ jobs:
             "$DO_USER@$DO_HOST" \
             "bash -s -- '$archive' '$INSTALL_MODULES' '$UPDATE_MODULES'" \
             < .github/scripts/deploy-remote.sh
+
+      - name: Verify public Odoo without changing business data
+        run: |
+          python - <<'PY'
+          import json
+          import urllib.request
+
+          base = 'https://www.holdinglalabranza.com'
+          request = urllib.request.Request(
+              base + '/web/webclient/version_info',
+              data=json.dumps({'jsonrpc': '2.0', 'method': 'call', 'params': {}, 'id': 1}).encode(),
+              headers={'Content-Type': 'application/json'},
+          )
+          with urllib.request.urlopen(request, timeout=20) as response:
+              version = json.load(response)['result']['server_version']
+              assert version.startswith('19.0') and '+e' in version, version
+          with urllib.request.urlopen(base + '/web/login', timeout=20) as response:
+              assert response.status == 200
+          print('SSH verified; public Odoo is available:', version)
+          PY
